@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
+from sglang.srt.layers.attention.nsa.triton_kernel import pack_nsa_kv_indices
+
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
 
@@ -277,7 +279,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "triton"
 ]
 
 
@@ -364,6 +366,21 @@ class NativeSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+        # Buffers for triton NSA decode (SM80 / Ampere and earlier)
+        if not _is_hip and (
+            self.nsa_decode_impl == "triton" or self.nsa_prefill_impl == "triton"
+        ):
+            self._triton_max_kv_splits = (
+                model_runner.server_args.triton_attention_num_kv_splits
+            )
+            max_bs = model_runner.req_to_token_pool.size
+            self._triton_kv_indptr = torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            )
+            self._triton_kv_indices = torch.zeros(
+                max_bs * self.nsa_index_topk, dtype=torch.int64, device=self.device
+            )
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -1456,6 +1473,18 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 layer=layer,
             )
+        elif nsa_impl == "triton":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_triton(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                nsa_cache_seqlens=metadata.nsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                v_head_dim=layer.v_head_dim,
+            )
         else:
             raise ValueError(
                 f"Unsupported {nsa_impl = } for forward_extend. Consider using an other attention backend."
@@ -1604,6 +1633,18 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 bs=forward_batch.batch_size,
+            )
+        elif self.nsa_decode_impl == "triton":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_triton(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                nsa_cache_seqlens=metadata.nsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                v_head_dim=layer.v_head_dim,
             )
 
         else:
@@ -1822,6 +1863,96 @@ class NativeSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+
+    def _forward_triton(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        nsa_cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        logit_cap: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """
+        Sparse MLA attention using the Triton decode kernel.  Works on SM80
+        (Ampere/A100) where flash_mla_sparse_fwd and flash_attn_with_kvcache
+        with qv are not supported.
+
+        q_all:            [total_q, num_heads, head_dim=kv_lora_rank+qk_rope_head_dim]
+        kv_cache:         [total_slots, 1, kv_cache_dim]  (contiguous)
+        page_table_1:     [total_q, topk]  int32 absolute KV slot indices
+        nsa_cache_seqlens:[total_q]  int32, valid KV count per query (clipped to topk)
+        """
+        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+            decode_attention_fwd,
+        )
+
+        total_q = q_all.shape[0]
+        num_heads = q_all.shape[1]
+        topk = page_table_1.shape[1]
+
+        # kv_indptr[i+1] = sum of nsa_cache_seqlens[0..i]
+        # Use pre-allocated buffer when total_q fits (decode), else allocate fresh.
+        # Both paths are CUDA-graph safe: allocations are captured once and reused.
+        if total_q + 1 <= self._triton_kv_indptr.shape[0]:
+            kv_indptr = self._triton_kv_indptr[: total_q + 1]
+        else:
+            kv_indptr = torch.empty(
+                total_q + 1, dtype=torch.int32, device=q_all.device
+            )
+        kv_indptr[0] = 0
+        torch.cumsum(nsa_cache_seqlens[:total_q], dim=0, out=kv_indptr[1:])
+
+        # Pack valid entries from page_table_1 into kv_indices
+        total_kv_max = total_q * topk
+        if total_kv_max <= self._triton_kv_indices.shape[0]:
+            kv_indices = self._triton_kv_indices[:total_kv_max]
+        else:
+            kv_indices = torch.empty(
+                total_kv_max, dtype=torch.int64, device=q_all.device
+            )
+        pack_nsa_kv_indices(
+            page_table_1, nsa_cache_seqlens[:total_q], kv_indptr, kv_indices
+        )
+
+        max_kv_splits = self._triton_max_kv_splits
+        attn_logits = torch.empty(
+            (total_q, num_heads, max_kv_splits, v_head_dim),
+            dtype=torch.float32,
+            device=q_all.device,
+        )
+        attn_lse = torch.empty(
+            (total_q, num_heads, max_kv_splits),
+            dtype=torch.float32,
+            device=q_all.device,
+        )
+        num_kv_splits = torch.full(
+            (total_q,), max_kv_splits, dtype=torch.int32, device=q_all.device
+        )
+        o = torch.empty(
+            (total_q, num_heads, v_head_dim), dtype=q_all.dtype, device=q_all.device
+        )
+
+        # v_buffer is a non-contiguous view of the first v_head_dim channels;
+        # the triton kernel respects strides so this is handled correctly.
+        decode_attention_fwd(
+            q=q_all,
+            k_buffer=kv_cache,
+            v_buffer=kv_cache[:, :, :v_head_dim],
+            o=o,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            attn_logits=attn_logits,
+            attn_lse=attn_lse,
+            num_kv_splits=num_kv_splits,
+            max_kv_splits=max_kv_splits,
+            sm_scale=sm_scale,
+            k_scale=1.0,
+            v_scale=1.0,
+            logit_cap=logit_cap,
+        )
+        return o
 
     def _forward_aiter(
         self,

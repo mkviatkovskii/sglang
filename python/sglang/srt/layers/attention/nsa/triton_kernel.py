@@ -194,3 +194,58 @@ def get_valid_kv_indices(
         bs,
         topk,
     )
+
+
+@triton.jit
+def _pack_nsa_kv_indices_kernel(
+    page_table_ptr,   # [total_q, topk], int32 absolute KV slot indices
+    nsa_seqlens_ptr,  # [total_q], int32, valid entry count per query
+    kv_indices_ptr,   # [total_q * topk], int64 output
+    kv_indptr_ptr,    # [total_q + 1], int32 prefix sums of nsa_seqlens
+    topk_stride: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    """
+    Pack the first nsa_seqlens[q_id] entries from page_table[q_id] into
+    kv_indices starting at kv_indptr[q_id].  Each program handles one query.
+    """
+    q_id = tl.program_id(0)
+    out_start = tl.load(kv_indptr_ptr + q_id)
+    n = tl.load(nsa_seqlens_ptr + q_id)
+    offs = tl.arange(0, BLOCK_TOPK)
+    mask = offs < n
+    vals = tl.load(
+        page_table_ptr + q_id * topk_stride + offs, mask=mask, other=0
+    ).to(tl.int64)
+    tl.store(kv_indices_ptr + out_start + offs, vals, mask=mask)
+
+
+def pack_nsa_kv_indices(
+    page_table_1: torch.Tensor,      # [total_q, topk] int32
+    nsa_cache_seqlens: torch.Tensor, # [total_q] int32
+    kv_indptr: torch.Tensor,         # [total_q + 1] int32, already filled
+    kv_indices: torch.Tensor,        # [total_q * topk] int64, output buffer
+):
+    """
+    Pack valid KV slot indices from page_table_1 into kv_indices.
+
+    For each query q_id, copies page_table_1[q_id, :nsa_cache_seqlens[q_id]]
+    into kv_indices[kv_indptr[q_id]:kv_indptr[q_id+1]].
+
+    Args:
+        page_table_1: absolute KV slot indices, shape [total_q, topk]
+        nsa_cache_seqlens: number of valid KV entries per query, shape [total_q]
+        kv_indptr: cumulative sums of nsa_cache_seqlens, shape [total_q + 1]
+        kv_indices: output buffer, shape [total_q * topk]
+    """
+    total_q = page_table_1.shape[0]
+    topk = page_table_1.shape[1]
+    BLOCK_TOPK = triton.next_power_of_2(topk)
+    _pack_nsa_kv_indices_kernel[(total_q,)](
+        page_table_1,
+        nsa_cache_seqlens,
+        kv_indices,
+        kv_indptr,
+        topk_stride=topk,
+        BLOCK_TOPK=BLOCK_TOPK,
+    )

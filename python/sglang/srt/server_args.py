@@ -171,6 +171,7 @@ NSA_CHOICES = [
     "tilelang",
     "aiter",
     "trtllm",
+    "triton",
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
@@ -1450,12 +1451,18 @@ class ServerArgs:
                     self.nsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
                     self.nsa_decode_backend = "trtllm"
-            else:
+            elif major >= 9:
                 # Hopper defaults for bfloat16
                 if not user_set_prefill:
                     self.nsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
                     self.nsa_decode_backend = "fa3"
+            else:
+                # Ampere (SM80) and earlier: flashmla_sparse/fa3 require Hopper+
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "triton"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "triton"
 
         logger.warning(
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."

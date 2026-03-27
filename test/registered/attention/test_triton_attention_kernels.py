@@ -149,6 +149,37 @@ def decode_attention_fwd_torch(
     return o_ref
 
 
+def decode_attention_fwd_torch_mla(
+    q: torch.Tensor,  # [B, H_Q, D_K]
+    k_buffer: torch.Tensor,  # [total_tokens, H_KV, D_K]
+    v_buffer: torch.Tensor,  # [total_tokens, H_KV, D_V]  (may differ from D_K)
+    kv_indptr: torch.Tensor,  # [B+1]
+    kv_indices: torch.Tensor,  # [total_kv_entries]
+    sm_scale: float,
+) -> torch.Tensor:  # [B, H_Q, D_V]
+    """Float32 reference for sparse decode attention supporting D_K != D_V (MLA absorbed)."""
+    B = kv_indptr.size(0) - 1
+    _, H_Q, _ = q.shape
+    _, H_KV, D_V = v_buffer.shape
+    group_size = H_Q // H_KV
+    o_ref = torch.zeros(B, H_Q, D_V, dtype=torch.float32, device=q.device)
+    for b in range(B):
+        start = int(kv_indptr[b].item())
+        end = int(kv_indptr[b + 1].item())
+        idx = kv_indices[start:end].long()
+        k_seq = k_buffer.index_select(0, idx).to(torch.float32)  # [L, H_KV, D_K]
+        v_seq = v_buffer.index_select(0, idx).to(torch.float32)  # [L, H_KV, D_V]
+        if group_size > 1:
+            k_seq = k_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D_K]
+            v_seq = v_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D_V]
+        q_f32 = q[b].to(torch.float32)  # [H_Q, D_K]
+        logits = torch.einsum("hd,lhd->hl", q_f32, k_seq) * sm_scale
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        p = torch.softmax(logits, dim=-1)  # [H_Q, L]
+        o_ref[b] = torch.einsum("hl,lhd->hd", p, v_seq)
+    return o_ref
+
+
 class TestTritonAttention(CustomTestCase):
 
     def _set_all_seeds(self, seed):
@@ -864,6 +895,91 @@ class TestTritonAttention(CustomTestCase):
             # Check that prefix and extend are concatenated correctly
             unified_seq = unified_kv_indices[start_idx:end_idx]
             self.assertEqual(len(unified_seq), prefix_len + extend_len)
+
+
+    def _test_grouped_decode_attention_sparse_once(
+        self, B, total_tokens, topk, H_Q, H_KV, D, D_V
+    ):
+        """decode_attention_fwd with sparse (non-contiguous) kv_indices and D_K != D_V.
+
+        This exercises the NSA/MLA access pattern used by _forward_triton:
+          k_buffer shape [N, 1, 576], v_buffer = k_buffer[:, :, :512] (non-contiguous).
+        Compared against decode_attention_fwd_torch_mla float32 reference.
+        """
+        dtype = torch.bfloat16
+        device = get_device()
+        sm_scale = 1.0 / (D**0.5)
+        max_kv_splits = 8
+
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+        # Non-contiguous v_buffer slice — mirrors kv_cache[:, :, :v_head_dim] in _forward_triton
+        v_buffer = k_buffer[:, :, :D_V]
+
+        # Sparse indices: each batch picks topk distinct random KV slots
+        kv_indptr = torch.zeros(B + 1, dtype=torch.int32, device=device)
+        kv_indptr[1:] = topk
+        kv_indptr = kv_indptr.cumsum(0).to(torch.int32)
+        kv_indices = torch.stack(
+            [torch.randperm(total_tokens, device=device)[:topk] for _ in range(B)]
+        ).flatten().to(torch.int64)
+
+        attn_logits = torch.empty(
+            (B, H_Q, max_kv_splits, D_V), dtype=torch.float32, device=device
+        )
+        attn_lse = torch.empty(
+            (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+        )
+        num_kv_splits = torch.full((B,), 4, dtype=torch.int32, device=device)
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
+
+        decode_attention_fwd(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            1.0,
+            1.0,
+        )
+
+        o_ref = decode_attention_fwd_torch_mla(
+            q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale
+        )
+
+        max_abs_err = (o.float() - o_ref).abs().max().item()
+        self.assertTrue(
+            torch.allclose(o.float(), o_ref, atol=1e-2, rtol=1e-2),
+            msg=(
+                f"sparse MLA decode_attention mismatch "
+                f"(H_Q={H_Q}, D={D}, D_V={D_V}, topk={topk}): max_abs_err={max_abs_err}"
+            ),
+        )
+
+    def test_grouped_decode_attention_nsa_sparse(self):
+        """Sparse decode attention with NSA/MLA dims (H_Q=128, H_KV=1, D=576, D_V=512).
+
+        Validates decode_attention_fwd with non-contiguous sparse kv_indices — the exact
+        access pattern produced by NativeSparseAttnBackend._forward_triton on SM80.
+        """
+        total_tokens = 4096
+        for topk in [16, 64]:
+            with self.subTest(topk=topk):
+                self._test_grouped_decode_attention_sparse_once(
+                    B=4,
+                    total_tokens=total_tokens,
+                    topk=topk,
+                    H_Q=128,
+                    H_KV=1,
+                    D=576,
+                    D_V=512,
+                )
 
 
 if __name__ == "__main__":

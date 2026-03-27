@@ -250,6 +250,7 @@ class MockModelRunner:
                 "enable_deterministic_inference": False,
                 "nsa_prefill_backend": "flashmla_sparse",
                 "nsa_decode_backend": "fa3",
+                "triton_attention_num_kv_splits": 8,
             },
         )()
 
@@ -679,6 +680,273 @@ class TestNSAIndexer(CustomTestCase):
                 expected_blocks = (seq_len + 63) // 64
                 self.assertEqual(page_table.shape[0], batch_size)
                 self.assertGreaterEqual(page_table.shape[1], expected_blocks)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestNSATritonForward(CustomTestCase):
+    """Tests for NativeSparseAttnBackend._forward_triton using MockModelRunner infrastructure.
+
+    Uses the same MockModelRunner pattern as TestNSAIndexer but with bfloat16 kv cache
+    (MLATokenToKVPool, use_nsa=True) and triton backends, matching the SM80 production path.
+    Correctness is verified against a float32 reference implementation.
+    """
+
+    # DeepSeek MLA dims
+    KV_LORA_RANK = 512
+    QK_ROPE_HEAD_DIM = 64
+    KV_CACHE_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
+    V_HEAD_DIM = KV_LORA_RANK  # 512
+    NUM_Q_HEADS = 128
+    NSA_TOPK = 64
+    MAX_BS = 16
+    MAX_CTX = 1024
+
+    @classmethod
+    def setUpClass(cls):
+        from sglang.srt.server_args import set_global_server_args_for_scheduler
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_dp_attention = False
+        server_args.nsa_prefill_backend = "triton"
+        server_args.nsa_decode_backend = "triton"
+        set_global_server_args_for_scheduler(server_args)
+
+    def _make_model_runner(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        device = "cuda"
+        total_slots = self.MAX_BS * self.MAX_CTX
+
+        hf_config = type(
+            "HfConfig",
+            (),
+            {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "index_topk": self.NSA_TOPK,
+                "index_head_dim": 128,
+                "index_n_heads": 32,
+            },
+        )()
+
+        model_config = type(
+            "ModelConfig",
+            (),
+            {
+                "context_len": self.MAX_CTX,
+                "attention_arch": None,
+                "num_attention_heads": self.NUM_Q_HEADS,
+                "kv_lora_rank": self.KV_LORA_RANK,
+                "qk_rope_head_dim": self.QK_ROPE_HEAD_DIM,
+                "qk_nope_head_dim": self.KV_LORA_RANK,
+                "hf_config": hf_config,
+            },
+        )()
+
+        req_to_token_pool = type(
+            "TokenPool",
+            (),
+            {
+                "size": self.MAX_BS,
+                "req_to_token": torch.zeros(
+                    self.MAX_BS, self.MAX_CTX, dtype=torch.int32, device=device
+                ),
+            },
+        )()
+
+        token_to_kv_pool = MLATokenToKVPool(
+            size=total_slots,
+            page_size=1,
+            dtype=torch.bfloat16,
+            kv_lora_rank=self.KV_LORA_RANK,
+            qk_rope_head_dim=self.QK_ROPE_HEAD_DIM,
+            layer_num=1,
+            device=device,
+            enable_memory_saver=False,
+            use_nsa=True,
+        )
+
+        server_args = type(
+            "ServerArgs",
+            (),
+            {
+                "kv_cache_dtype": "auto",
+                "speculative_eagle_topk": None,
+                "speculative_num_draft_tokens": 0,
+                "enable_deterministic_inference": False,
+                "nsa_prefill_backend": "triton",
+                "nsa_decode_backend": "triton",
+                "triton_attention_num_kv_splits": 8,
+            },
+        )()
+
+        return type(
+            "ModelRunner",
+            (),
+            {
+                "device": device,
+                "page_size": 1,
+                "model_config": model_config,
+                "req_to_token_pool": req_to_token_pool,
+                "token_to_kv_pool": token_to_kv_pool,
+                "server_args": server_args,
+                "kv_cache_dtype": "auto",
+            },
+        )()
+
+    def setUp(self):
+        import math
+
+        torch.manual_seed(0)
+        self.model_runner = self._make_model_runner()
+        self.backend = NativeSparseAttnBackend(self.model_runner)
+        kv_pool = self.model_runner.token_to_kv_pool
+        kv_pool.kv_buffer[0].normal_()
+        self.kv_cache = kv_pool.get_key_buffer(0)  # [total_slots+1, 1, 576]
+        self.sm_scale = 1.0 / math.sqrt(self.KV_CACHE_DIM)
+
+    def _reference(self, q_all, page_table_1, nsa_seqlens):
+        """Float32 reference: gather selected KV slots and run full softmax attention."""
+        total_q, num_heads, _ = q_all.shape
+        q_f32 = q_all.float()
+        kv_f32 = self.kv_cache.float()
+        ref_o = torch.zeros(
+            total_q, num_heads, self.V_HEAD_DIM, dtype=torch.float32, device=q_all.device
+        )
+        for i in range(total_q):
+            n = nsa_seqlens[i].item()
+            slots = page_table_1[i, :n]
+            k_sel = kv_f32[slots, 0, :]  # [n, 576]
+            v_sel = kv_f32[slots, 0, : self.V_HEAD_DIM]  # [n, 512]
+            scores = torch.einsum("hd,kd->hk", q_f32[i], k_sel) * self.sm_scale
+            ref_o[i] = torch.einsum("hk,kd->hd", torch.softmax(scores, dim=-1), v_sel)
+        return ref_o
+
+    def _run(self, q_all, page_table_1, nsa_seqlens):
+        return self.backend._forward_triton(
+            q_all=q_all,
+            kv_cache=self.kv_cache,
+            page_table_1=page_table_1,
+            nsa_cache_seqlens=nsa_seqlens,
+            sm_scale=self.sm_scale,
+            logit_cap=0.0,
+            v_head_dim=self.V_HEAD_DIM,
+        )
+
+    def _make_inputs(self, total_q, topk):
+        device = "cuda"
+        max_slot = self.kv_cache.shape[0] - 1
+        q = torch.randn(
+            total_q, self.NUM_Q_HEADS, self.KV_CACHE_DIM,
+            dtype=torch.bfloat16, device=device,
+        )
+        page_table_1 = torch.stack(
+            [torch.randperm(max_slot, device=device)[:topk] for _ in range(total_q)]
+        ).to(torch.int32)
+        nsa_seqlens = torch.full((total_q,), topk, dtype=torch.int32, device=device)
+        return q, page_table_1, nsa_seqlens
+
+    def _assert_close(self, label, actual, expected, atol_max=0.05, atol_mean=0.005):
+        diff = (actual.float() - expected).abs()
+        max_d = diff.max().item()
+        mean_d = diff.mean().item()
+        self.assertLess(
+            max_d, atol_max,
+            f"{label}: max_diff {max_d:.6f} >= {atol_max}",
+        )
+        self.assertLess(
+            mean_d, atol_mean,
+            f"{label}: mean_diff {mean_d:.6f} >= {atol_mean}",
+        )
+
+    def test_decode_full_topk(self):
+        """Decode: all queries have exactly topk valid KV tokens."""
+        bs, topk = 4, 32
+        q, pt, sl = self._make_inputs(bs, topk)
+        ref = self._reference(q, pt, sl)
+        out = self._run(q, pt, sl)
+        self._assert_close("triton vs reference (full topk)", out, ref)
+
+    def test_decode_variable_seqlens(self):
+        """Decode: queries with varying numbers of valid KV tokens."""
+        topk, bs = 32, 6
+        q, pt, _ = self._make_inputs(bs, topk)
+        nsa_seqlens = torch.tensor(
+            [5, 32, 12, 32, 1, 20], dtype=torch.int32, device="cuda"
+        )
+        for i in range(bs):
+            pt[i, nsa_seqlens[i]:] = -1
+        ref = self._reference(q, pt, nsa_seqlens)
+        out = self._run(q, pt, nsa_seqlens)
+        self._assert_close("triton vs reference (variable seqlens)", out, ref)
+
+    def test_extend_mode(self):
+        """Extend/prefill: multiple query tokens per call."""
+        total_q, topk = 16, 16
+        q, pt, sl = self._make_inputs(total_q, topk)
+        ref = self._reference(q, pt, sl)
+        out = self._run(q, pt, sl)
+        self._assert_close("triton vs reference (extend)", out, ref)
+
+    def test_single_token_batch(self):
+        """Edge case: single query token."""
+        q, pt, sl = self._make_inputs(total_q=1, topk=self.NSA_TOPK)
+        ref = self._reference(q, pt, sl)
+        out = self._run(q, pt, sl)
+        self._assert_close("triton vs reference (bs=1)", out, ref)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9,
+        "flashmla_sparse requires SM90+",
+    )
+    def test_triton_vs_flashmla_sparse(self):
+        """On Hopper: _forward_triton and _forward_flashmla_sparse must agree."""
+        bs, topk = 4, self.NSA_TOPK
+        q, pt, sl = self._make_inputs(bs, topk)
+        out_triton = self._run(q, pt, sl)
+        out_flashmla = self.backend._forward_flashmla_sparse(
+            q_all=q,
+            kv_cache=self.kv_cache,
+            page_table_1=pt,
+            sm_scale=self.sm_scale,
+            v_head_dim=self.V_HEAD_DIM,
+        )
+        self._assert_close(
+            "triton vs flashmla_sparse", out_triton, out_flashmla.float()
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9,
+        "fa3 (flash_attn_with_kvcache with qv) requires SM90+",
+    )
+    def test_triton_vs_fa3(self):
+        """On Hopper: _forward_triton and _forward_fa3 must agree."""
+        from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
+            compute_cu_seqlens,
+        )
+
+        bs, topk = 4, self.NSA_TOPK
+        q, pt, sl = self._make_inputs(bs, topk)
+        q_nope = q[:, :, : self.V_HEAD_DIM]
+        q_rope = q[:, :, self.V_HEAD_DIM :]
+        cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+        cu_seqlens_k = compute_cu_seqlens(sl)
+
+        out_triton = self._run(q, pt, sl)
+        out_fa3 = self.backend._forward_fa3(
+            q_rope=q_rope,
+            kv_cache=self.kv_cache,
+            v_head_dim=self.V_HEAD_DIM,
+            q_nope=q_nope,
+            page_table=pt,
+            cache_seqlens=sl,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=1,
+            sm_scale=self.sm_scale,
+            logit_cap=0.0,
+            page_size=1,
+        )
+        self._assert_close("triton vs fa3", out_triton, out_fa3.float())
 
 
 if __name__ == "__main__":
